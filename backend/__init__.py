@@ -1,0 +1,1 @@
+"""VendorMender backend package."""
