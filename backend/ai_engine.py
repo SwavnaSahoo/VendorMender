@@ -1,23 +1,32 @@
-"""Vendor text/file extraction interface.
+"""VendorMender AI helpers.
 
-This is a clean local replacement for the deleted prototype module. It keeps
-VendorMender functional without requiring an external model. Later, you can
-replace the extraction internals with Gemini/OpenAI/etc. while keeping these
-function signatures and the API unchanged.
+This module keeps the existing deterministic text-extraction behavior and adds
+an optional Gemini-powered semantic column mapper for messy vendor catalogs.
+
+Design principle:
+- deterministic rules handle obvious matches cheaply and predictably
+- Gemini is used only for unresolved/ambiguous columns
+- Gemini can suggest mappings, but it cannot change marketplace requirements
+- readiness remains deterministic in readiness.py
 """
 
 from __future__ import annotations
 
-from io import BytesIO
 import json
+import os
 import re
+from io import BytesIO
 from typing import Any
 
 import pandas as pd
+from pydantic import BaseModel, Field
 
 from .readiness import is_missing
-from .schemas import ALL_FIELDS
 
+
+# =========================================================
+# EXISTING TEXT EXTRACTION
+# =========================================================
 
 FIELD_ALIASES = {
     "Business Name": ["business name", "brand", "company", "company name"],
@@ -80,14 +89,7 @@ def _extract_submission_text(context: str) -> str:
     return context
 
 
-def _extract_key_value_fields(text: str, category: str | None = None) -> dict[str, Any]:
-    """Extract canonical marketplace fields from key/value OR natural-language vendor text.
-
-    This is deliberately deterministic so readiness never depends on the model.
-    An LLM can enrich these values later, but this function provides a safe
-    baseline and fixes the common failure where prose was treated as if it had
-    to be written as ``Field: value`` lines.
-    """
+def _extract_key_value_fields(text: str) -> dict[str, Any]:
     extracted: dict[str, Any] = {}
     alias_lookup = {
         alias.lower(): field
@@ -95,7 +97,6 @@ def _extract_key_value_fields(text: str, category: str | None = None) -> dict[st
         for alias in aliases + [field]
     }
 
-    # 1) Explicit key/value lines remain the highest-confidence source.
     for raw_line in text.splitlines():
         line = raw_line.strip().strip("-*•")
         if not line or ":" not in line:
@@ -105,113 +106,28 @@ def _extract_key_value_fields(text: str, category: str | None = None) -> dict[st
         if canonical and value.strip():
             extracted[canonical] = value.strip()
 
-    flat = re.sub(r"\s+", " ", text).strip()
-
-    # 2) Common natural-language identity patterns.
-    if "Business Name" not in extracted:
-        business_patterns = [
-            r"\bwe(?:'|’)re\s+([A-Z][A-Za-z0-9&'’ .-]{1,60}?)(?=,|\s+(?:a|an)\s+|\s+based\b|[.!?])",
-            r"\bwe are\s+([A-Z][A-Za-z0-9&'’ .-]{1,60}?)(?=,|\s+(?:a|an)\s+|\s+based\b|[.!?])",
-            r"\b(?:brand|business|company)\s+(?:is|called)\s+([A-Z][A-Za-z0-9&'’ .-]{1,60}?)(?=[,.!?])",
-        ]
-        for pattern in business_patterns:
-            m = re.search(pattern, flat, flags=re.I)
-            if m:
-                extracted["Business Name"] = m.group(1).strip(" ,.-")
-                break
-
-    if "Product Name" not in extracted:
-        product_patterns = [
-            r"\bit(?:'|’)s called\s+(?:the\s+)?(.+?)(?=\s+and\s+(?:it(?:'|’)s|it is)\s+\$|[.!?])",
-            r"\bproduct(?:\s+is)?\s+called\s+(?:the\s+)?(.+?)(?=[.!?])",
-            r"\bcalled\s+(?:the\s+)?([A-Z][A-Za-z0-9&'’ /-]{2,80}?)(?=\s+and\s+|[.!?])",
-        ]
-        for pattern in product_patterns:
-            m = re.search(pattern, flat, flags=re.I)
-            if m:
-                extracted["Product Name"] = m.group(1).strip(" ,.-")
-                break
-
-    # 3) Universal signals.
     if "Price" not in extracted:
-        price_match = re.search(r"(?:\$|USD\s*)(\d+(?:\.\d{1,2})?)", flat, flags=re.I)
+        price_match = re.search(r"(?:\$|USD\s*)(\d+(?:\.\d{1,2})?)", text, flags=re.I)
         if price_match:
             extracted["Price"] = float(price_match.group(1))
 
     if "Contact Information" not in extracted:
-        email_match = re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", flat)
+        email_match = re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", text)
         if email_match:
             extracted["Contact Information"] = email_match.group(0)
 
     if "Instagram / Social Media" not in extracted:
-        insta_match = re.search(r"(?<!\w)@[A-Za-z0-9._]{2,}", flat)
+        insta_match = re.search(r"(?<!\w)@[A-Za-z0-9._]{2,}", text)
         if insta_match:
             extracted["Instagram / Social Media"] = insta_match.group(0)
 
     if "Website" not in extracted:
-        url_match = re.search(r"https?://\S+|www\.\S+", flat, flags=re.I)
+        url_match = re.search(r"https?://\S+|www\.\S+", text, flags=re.I)
         if url_match:
             extracted["Website"] = url_match.group(0).rstrip(".,)")
 
-    if "Location" not in extracted:
-        m = re.search(r"\bbased in\s+([A-Za-z .'-]{2,60}?)(?=[,.!?]|\s+and\b)", flat, flags=re.I)
-        if m:
-            extracted["Location"] = m.group(1).strip()
-
-    if "Shipping Information" not in extracted:
-        m = re.search(r"([^.!?]*\bship(?:s|ping)?\b[^.!?]*[.!?]?)", flat, flags=re.I)
-        if m:
-            extracted["Shipping Information"] = m.group(1).strip()
-
-    # 4) Category-aware prose extraction. These are conservative patterns: a
-    # value is only accepted when the vendor actually said it.
-    category = (category or "").upper()
-    if category == "TABLEWARE":
-        if "Material" not in extracted:
-            m = re.search(r"\b(stoneware|ceramic|porcelain|bone china|earthenware|glass|stainless steel|wood|bamboo|melamine)\b", flat, flags=re.I)
-            if m:
-                extracted["Material"] = m.group(1).title()
-
-        if "Dimensions" not in extracted:
-            m = re.search(r"\b(?:about\s+)?(\d+(?:\.\d+)?)\s*(inches?|in\.?|cm|mm)\b", flat, flags=re.I)
-            if m:
-                extracted["Dimensions"] = f"{m.group(1)} {m.group(2)}"
-
-        if "Set Quantity" not in extracted:
-            m = re.search(r"\b(\d+)\s*[- ]?piece\b", flat, flags=re.I)
-            if m:
-                qty = m.group(1)
-                serves = re.search(r"\bfor\s+(\d+)\s+(?:people|persons?)\b", flat, flags=re.I)
-                extracted["Set Quantity"] = f"{qty} pieces" + (f" / serves {serves.group(1)}" if serves else "")
-
-        if "Dishwasher Safe" not in extracted and re.search(r"\bdishwasher\s+safe\b", flat, flags=re.I):
-            negated = re.search(r"\b(?:not|isn't|isn’t|aren't|aren’t)\s+[^.!?]{0,20}dishwasher\s+safe\b", flat, flags=re.I)
-            extracted["Dishwasher Safe"] = not bool(negated)
-
-        if "Care Instructions" not in extracted:
-            m = re.search(r"([^.!?]*(?:hand\s*wash(?:ing)?|care|wipe clean|do not soak)[^.!?]*[.!?]?)", flat, flags=re.I)
-            if m:
-                extracted["Care Instructions"] = m.group(1).strip()
-
-    elif category == "APPAREL":
-        if "Fabric" not in extracted:
-            m = re.search(r"\b(?:100%\s+)?(linen|cotton|silk|wool|polyester|rayon|viscose|denim|cashmere|nylon|spandex)\b", flat, flags=re.I)
-            if m:
-                extracted["Fabric"] = m.group(0)
-        if "Size" not in extracted:
-            m = re.search(r"\b(?:sizes?|available in)\s*[:\-]?\s*((?:XXS|XS|S|M|L|XL|XXL)(?:\s*[-–,/ ]\s*(?:XXS|XS|S|M|L|XL|XXL))*)", flat, flags=re.I)
-            if m:
-                extracted["Size"] = m.group(1).upper()
-        if "Color" not in extracted:
-            m = re.search(r"\b(black|white|pink|blue|green|red|beige|cream|brown|navy|grey|gray)\b", flat, flags=re.I)
-            if m:
-                extracted["Color"] = m.group(1).title()
-        if "Care Instructions" not in extracted:
-            m = re.search(r"([^.!?]*(?:hand\s*wash|machine\s*wash|dry clean|care)[^.!?]*[.!?]?)", flat, flags=re.I)
-            if m:
-                extracted["Care Instructions"] = m.group(1).strip()
-
     return extracted
+
 
 def _question_for(field: str) -> str:
     prompts = {
@@ -265,7 +181,9 @@ def _analysis_from_extracted(
         "optional_gaps": optional_gaps,
         "follow_up_questions": [_question_for(field) for field in required_gaps],
         "readiness_score": readiness,
-        "status": "Publish Ready" if not required_gaps else ("Almost Ready" if readiness >= 80 else "Needs Information"),
+        "status": "Publish Ready"
+        if not required_gaps
+        else ("Almost Ready" if readiness >= 80 else "Needs Information"),
         "extracted_fields": extracted,
     }
 
@@ -276,9 +194,8 @@ def analyze_vendor_text(context: str) -> dict:
     optional_fields = _extract_list_from_context(context, "OPTIONAL FIELDS")
     category = _extract_category_from_context(context)
     submission = _extract_submission_text(context)
-    extracted = _extract_key_value_fields(submission, category)
+    extracted = _extract_key_value_fields(submission)
 
-    # Category is context, not something the vendor should have to repeat.
     if category and "Category" in required_fields and "Category" not in extracted:
         extracted["Category"] = category
 
@@ -291,13 +208,7 @@ def analyze_vendor_text(context: str) -> dict:
 
 
 def analyze_vendor_files(uploaded_files, catalog_context: str) -> dict:
-    """Compatibility function for the legacy Streamlit prototype.
-
-    Reads CSV/XLSX/TXT files where possible and counts actual uploaded images
-    as satisfying Product Images. PDF text extraction is intentionally not
-    guessed here; the file is acknowledged but should later be routed through
-    a dedicated parser/model service.
-    """
+    """Compatibility function for the legacy Streamlit prototype."""
     required_fields = _extract_list_from_context(catalog_context, "REQUIRED FIELDS")
     optional_fields = _extract_list_from_context(catalog_context, "OPTIONAL FIELDS")
     category = _extract_category_from_context(catalog_context)
@@ -330,7 +241,7 @@ def analyze_vendor_files(uploaded_files, catalog_context: str) -> dict:
 
         combined_text.append(f"Uploaded file: {uploaded.name}")
 
-    extracted = _extract_key_value_fields("\n".join(combined_text), category)
+    extracted = _extract_key_value_fields("\n".join(combined_text))
     if category and "Category" in required_fields:
         extracted.setdefault("Category", category)
     if actual_image_count:
@@ -355,7 +266,10 @@ def update_vendor_analysis(schema_context: str, answers: list[dict]) -> dict:
     base = analyze_vendor_text(original_context)
     extracted = dict(base.get("extracted_fields", {}))
 
-    required_fields = _extract_list_from_context(schema_context, "REQUIRED FIELDS") or base.get("required_gaps", [])
+    required_fields = (
+        _extract_list_from_context(schema_context, "REQUIRED FIELDS")
+        or base.get("required_gaps", [])
+    )
     optional_fields = _extract_list_from_context(schema_context, "OPTIONAL FIELDS")
     category = _extract_category_from_context(schema_context) or base.get("category")
 
@@ -366,7 +280,11 @@ def update_vendor_analysis(schema_context: str, answers: list[dict]) -> dict:
             continue
 
         matched_field = next(
-            (field for field in required_fields + optional_fields if field.lower() in question.lower()),
+            (
+                field
+                for field in required_fields + optional_fields
+                if field.lower() in question.lower()
+            ),
             None,
         )
         if matched_field:
@@ -378,3 +296,186 @@ def update_vendor_analysis(schema_context: str, answers: list[dict]) -> dict:
         optional_fields=optional_fields,
         category=category,
     )
+
+
+# =========================================================
+# GEMINI SEMANTIC COLUMN MAPPER
+# =========================================================
+
+class SemanticColumnDecision(BaseModel):
+    source_column: str
+    target_field: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str
+
+
+class SemanticMappingResponse(BaseModel):
+    decisions: list[SemanticColumnDecision]
+
+
+def _get_gemini_client():
+    """Return a Gemini client, or None when no API key is configured."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    try:
+        from google import genai
+    except ImportError:
+        return None
+
+    return genai.Client(api_key=api_key)
+
+
+def semantic_map_columns(
+    *,
+    category: str,
+    allowed_fields: list[str],
+    unresolved_columns: list[dict[str, Any]],
+    already_mapped_fields: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Use Gemini to map unresolved vendor columns to marketplace fields.
+
+    Each unresolved column is shaped like:
+        {
+            "name": "Mat.",
+            "samples": ["ceramic", "stoneware", "porcelain"]
+        }
+
+    The model may choose only one of ``allowed_fields`` or ``PRESERVE``.
+    Failures degrade safely to PRESERVE instead of breaking catalog upload.
+    """
+
+    if not unresolved_columns:
+        return []
+
+    client = _get_gemini_client()
+    if client is None:
+        return [
+            {
+                "source_column": item["name"],
+                "target_field": "PRESERVE",
+                "confidence": 0.0,
+                "reason": "AI mapper unavailable; preserved for manual review.",
+            }
+            for item in unresolved_columns
+        ]
+
+    already_mapped_fields = already_mapped_fields or []
+    candidate_fields = [
+        field for field in allowed_fields if field not in set(already_mapped_fields)
+    ]
+
+    prompt_payload = {
+        "category": category,
+        "allowed_target_fields": candidate_fields,
+        "already_mapped_fields": already_mapped_fields,
+        "incoming_columns": unresolved_columns,
+    }
+
+    prompt = f"""
+You are VendorMender's semantic catalog-column mapper.
+
+Your job is ONLY to map messy vendor spreadsheet columns to the marketplace's
+allowed canonical fields.
+
+IMPORTANT RULES:
+1. For each incoming column, choose exactly ONE target_field from
+   allowed_target_fields, OR choose the literal string PRESERVE.
+2. Never invent a marketplace field.
+3. Never map a column to a field that is already listed in already_mapped_fields.
+4. Use BOTH the column name and its sample cell values.
+5. Abbreviations, shorthand, spelling variation, and vendor jargon are allowed.
+6. If the semantic meaning is ambiguous, use PRESERVE rather than guessing.
+7. Confidence must be a number from 0.0 to 1.0.
+8. Return one decision for every incoming column.
+9. Do not decide whether a product is publish-ready. You only map columns.
+10. Product requirements are controlled elsewhere; do not add or remove them.
+
+Examples of semantic reasoning:
+- "Mat." with values like ceramic/stoneware can mean Material.
+- "Qty Set" with values like 4 bowls/6 pieces can mean Set Quantity.
+- "DW Safe?" with values Y/No/Yes can mean Dishwasher Safe.
+- "Measurements" with values like 8 in diameter can mean Dimensions.
+- "Cost" with currency-like numeric values can mean Price.
+- If a column has no allowed semantic equivalent, return PRESERVE.
+
+INPUT:
+{json.dumps(prompt_payload, ensure_ascii=False, indent=2, default=str)}
+""".strip()
+
+    try:
+        from google.genai import types
+
+        model_name = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=SemanticMappingResponse,
+                temperature=0,
+            ),
+        )
+
+        parsed = json.loads(response.text or "{}")
+        payload = SemanticMappingResponse.model_validate(parsed)
+        decisions = payload.decisions
+
+    except Exception as exc:
+        return [
+            {
+                "source_column": item["name"],
+                "target_field": "PRESERVE",
+                "confidence": 0.0,
+                "reason": f"AI mapper failed safely: {type(exc).__name__}",
+            }
+            for item in unresolved_columns
+        ]
+
+    unresolved_names = {item["name"] for item in unresolved_columns}
+    valid_targets = set(candidate_fields) | {"PRESERVE"}
+    normalized: list[dict[str, Any]] = []
+    seen_sources: set[str] = set()
+    seen_targets: set[str] = set(already_mapped_fields)
+
+    for decision in decisions:
+        source = decision.source_column
+        target = decision.target_field
+
+        if source not in unresolved_names or source in seen_sources:
+            continue
+
+        if target not in valid_targets:
+            target = "PRESERVE"
+
+        if target != "PRESERVE" and target in seen_targets:
+            target = "PRESERVE"
+
+        if target != "PRESERVE":
+            seen_targets.add(target)
+
+        seen_sources.add(source)
+        normalized.append(
+            {
+                "source_column": source,
+                "target_field": target,
+                "confidence": round(float(decision.confidence), 4),
+                "reason": decision.reason.strip(),
+            }
+        )
+
+    # Guarantee a safe decision for every unresolved source column.
+    returned_sources = {item["source_column"] for item in normalized}
+    for item in unresolved_columns:
+        if item["name"] not in returned_sources:
+            normalized.append(
+                {
+                    "source_column": item["name"],
+                    "target_field": "PRESERVE",
+                    "confidence": 0.0,
+                    "reason": "No valid semantic mapping was returned; preserved for review.",
+                }
+            )
+
+    return normalized
